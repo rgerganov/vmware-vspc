@@ -75,7 +75,9 @@ SUPPORTED_OPTS = (KNOWN_SUBOPTIONS_1 + KNOWN_SUBOPTIONS_2 + VMOTION_BEGIN +
 
 class VspcServer(object):
     def __init__(self):
-        self.sock_to_uuid = dict()
+        self._uuid_to_vm_writer = dict()
+        self._uuid_to_client_writers = dict()
+        self._loop = asyncio.get_event_loop()
 
     @asyncio.coroutine
     def handle_known_suboptions(self, writer, data):
@@ -111,7 +113,7 @@ class VspcServer(object):
         LOG.debug("<< %s VM-VC-UUID %s", peer, uuid)
         uuid = uuid.replace(' ', '')
         uuid = uuid.replace('-', '')
-        self.sock_to_uuid[socket] = uuid
+        return uuid
 
     @asyncio.coroutine
     def handle_vmotion_begin(self, writer, data):
@@ -166,7 +168,7 @@ class VspcServer(object):
             yield from writer.drain()
 
     @asyncio.coroutine
-    def option_handler(self, cmd, opt, writer, data=None):
+    def option_handler(self, cmd, opt, writer, data=None, vm_uuid_rcvd=None):
         socket = writer.get_extra_info('socket')
         if cmd == SE and data[0:1] == VMWARE_EXT:
             vmw_cmd = data[1:2]
@@ -175,7 +177,8 @@ class VspcServer(object):
             elif vmw_cmd == DO_PROXY:
                 yield from self.handle_do_proxy(writer, data[2:])
             elif vmw_cmd == VM_VC_UUID:
-                self.handle_vm_vc_uuid(socket, data[2:])
+                vm_uuid = self.handle_vm_vc_uuid(socket, data[2:])
+                vm_uuid_rcvd.set_result(vm_uuid)
             elif vmw_cmd == VMOTION_BEGIN:
                 yield from self.handle_vmotion_begin(writer, data[2:])
             elif vmw_cmd == VMOTION_PEER:
@@ -196,29 +199,72 @@ class VspcServer(object):
             f.write(data)
 
     @asyncio.coroutine
+    def handle_proxy(self, reader, writer, uuid):
+        LOG.info("Proxy client connected for uuid: %s", uuid)
+        client_writers = self._uuid_to_client_writers.get(uuid, [])
+        client_writers.append(writer)
+        self._uuid_to_client_writers[uuid] = client_writers
+        data = yield from reader.read(1024)
+        try:
+            while data:
+                vm_writer = self._uuid_to_vm_writer.get(uuid)
+                if not vm_writer:
+                    break
+                vm_writer.write(data)
+                yield from vm_writer.drain()
+                data = yield from reader.read(1024)
+        finally:
+            self._uuid_to_client_writers[uuid].remove(writer)
+        LOG.info("Proxy client disconnected for uuid: %s", uuid)
+        writer.close()
+
+    @asyncio.coroutine
     def handle_telnet(self, reader, writer):
-        opt_handler = functools.partial(self.option_handler, writer=writer)
+        vm_uuid_rcvd = asyncio.Future()
+        opt_handler = functools.partial(self.option_handler, writer=writer,
+                                        vm_uuid_rcvd=vm_uuid_rcvd)
         telnet = async_telnet.AsyncTelnet(reader, opt_handler)
         socket = writer.get_extra_info('socket')
         peer = socket.getpeername()
         LOG.info("%s connected", peer)
-        data = yield from telnet.read_some()
-        uuid = self.sock_to_uuid.get(socket)
-        if uuid is None:
+
+        read_task = self._loop.create_task(telnet.read_some())
+        try:
+            uuid = yield from asyncio.wait_for(vm_uuid_rcvd, 2)
+        except asyncio.TimeoutError:
             LOG.error("%s didn't present UUID", peer)
             writer.close()
             return
+        self._uuid_to_vm_writer[uuid] = writer
+
+        proxy_handler = functools.partial(self.handle_proxy, uuid=uuid)
+        coro = asyncio.start_server(proxy_handler, '127.0.0.1', 9999, loop=self._loop)
+        proxy_srv = yield from asyncio.wait_for(coro, None)
+        LOG.info("Started proxy server on port 9999")
+
+        data = yield from asyncio.wait_for(read_task, None)
         try:
             while data:
                 self.save_to_log(uuid, data)
+                client_writers = self._uuid_to_client_writers.get(uuid, [])
+                for client_writer in client_writers:
+                    client_writer.write(data)
+                    yield from client_writer.drain()
                 data = yield from telnet.read_some()
         finally:
-            self.sock_to_uuid.pop(socket, None)
+            self._uuid_to_vm_writer.pop(uuid)
         LOG.info("%s disconnected", peer)
+
+        LOG.info("Stopping proxy server on port 9999")
+        proxy_srv.close()
+        yield from asyncio.wait_for(proxy_srv.wait_closed(), None)
+        client_writers = self._uuid_to_client_writers.get(uuid, [])
+        for client_writer in client_writers:
+            client_writer.close()
+
         writer.close()
 
     def start(self):
-        loop = asyncio.get_event_loop()
         ssl_context = None
         if CONF.cert:
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
@@ -227,21 +273,28 @@ class VspcServer(object):
                                     CONF.host,
                                     CONF.port,
                                     ssl=ssl_context,
-                                    loop=loop)
-        server = loop.run_until_complete(coro)
+                                    loop=self._loop)
+        server = self._loop.run_until_complete(coro)
 
         # Serve requests until Ctrl+C is pressed
         LOG.info("Serving on %s", server.sockets[0].getsockname())
         LOG.info("Log directory: %s", CONF.serial_log_dir)
         try:
-            loop.run_forever()
+            self._loop.run_forever()
         except KeyboardInterrupt:
             pass
 
         # Close the server
         server.close()
-        loop.run_until_complete(server.wait_closed())
-        loop.close()
+        self._loop.run_until_complete(server.wait_closed())
+
+        for vm_writer in self._uuid_to_vm_writer.values():
+            vm_writer.close()
+
+        for task in asyncio.Task.all_tasks():
+            self._loop.run_until_complete(task)
+
+        self._loop.close()
 
 
 def main():
