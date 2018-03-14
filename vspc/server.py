@@ -39,7 +39,13 @@ opts = [
     cfg.IntOpt('vm_start_port',
                default=20000,
                help='Start port for client connection listeners'),
-    cfg.IntOpt('enable_clients',
+    cfg.StrOpt('admin_host',
+               default='127.0.0.1',
+               help='Host on which to listen for admin requests'),
+    cfg.IntOpt('admin_port',
+               default=13371,
+               help='Port on which to listen for admin requests'),
+    cfg.BoolOpt('enable_clients',
                default=False,
                help='If enabled, accept client connections on "client_host" and '
                     'relay traffic between VMs and clients'),
@@ -239,10 +245,9 @@ class VspcServer(object):
         raise Exception("Unable to find free port")
 
     @asyncio.coroutine
-    def _start_client_listener(self, writer, uuid):
+    def _start_client_listener(self, uuid):
         port = self._find_port()
         client_handler = functools.partial(self.handle_client, uuid=uuid)
-        self._uuid_to_vm_writer[uuid] = writer
         self._uuid_to_port[uuid] = port
         try:
             coro = asyncio.start_server(client_handler, CONF.client_host, port, loop=self._loop)
@@ -259,7 +264,6 @@ class VspcServer(object):
     def _stop_client_listener(self, uuid):
         port = self._uuid_to_port.pop(uuid)
         LOG.info("Stopping client listener on port %d for VM with UUID='%s'", port, uuid)
-        del self._uuid_to_vm_writer[uuid]
         client_listener = self._uuid_to_client_listener.pop(uuid)
         client_listener.close()
         yield from asyncio.wait_for(client_listener.wait_closed(), None)
@@ -292,8 +296,9 @@ class VspcServer(object):
             writer.close()
             return
 
+        self._uuid_to_vm_writer[uuid] = writer
         if CONF.enable_clients:
-            yield from self._start_client_listener(writer, uuid)
+            yield from self._start_client_listener(uuid)
         data = yield from asyncio.wait_for(read_task, None)
         try:
             while data:
@@ -302,9 +307,34 @@ class VspcServer(object):
                     self._dispatch_to_client_writers(data, uuid)
                 data = yield from telnet.read_some()
         finally:
+            del self._uuid_to_vm_writer[uuid]
             if CONF.enable_clients:
                 yield from self._stop_client_listener(uuid)
         LOG.info("%s disconnected", peer)
+        writer.close()
+
+    @asyncio.coroutine
+    def handle_admin(self, reader, writer):
+        line_b = yield from reader.readline()
+        line = line_b.decode('ascii').strip()
+        if line == 'LIST':
+            for uuid, port in self._uuid_to_port.items():
+                ans = "%s -> %s:%d\n" % (uuid, CONF.client_host, port)
+                writer.write(ans.encode('ascii'))
+            yield from writer.drain()
+            writer.close()
+            return
+        parts = line.split()
+        if parts[0] == 'GET':
+            vm_uuid = parts[1]
+            port = self._uuid_to_port.get(vm_uuid)
+            if port:
+                ans = "%s:%d\n" % (CONF.client_host, port)
+                writer.write(ans.encode('ascii'))
+                yield from writer.drain()
+            else:
+                writer.write("None\n".encode('ascii'))
+                yield from writer.drain()
         writer.close()
 
     def start(self):
@@ -319,6 +349,14 @@ class VspcServer(object):
                                     loop=self._loop)
         server = self._loop.run_until_complete(coro)
 
+        if CONF.enable_clients:
+            coro = asyncio.start_server(self.handle_admin,
+                                        CONF.admin_host,
+                                        CONF.admin_port,
+                                        ssl=ssl_context,
+                                        loop=self._loop)
+            admin_server = self._loop.run_until_complete(coro)
+
         # Serve requests until Ctrl+C is pressed
         LOG.info("Serving on %s", server.sockets[0].getsockname())
         LOG.info("Log directory: %s", CONF.serial_log_dir)
@@ -331,10 +369,15 @@ class VspcServer(object):
         server.close()
         self._loop.run_until_complete(server.wait_closed())
 
+        if CONF.enable_clients:
+            admin_server.close()
+            self._loop.run_until_complete(admin_server.wait_closed())
+
         for vm_writer in self._uuid_to_vm_writer.values():
             vm_writer.close()
 
         for task in asyncio.Task.all_tasks():
+            #task.print_stack()
             self._loop.run_until_complete(task)
 
         self._loop.close()
