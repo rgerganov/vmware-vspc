@@ -29,10 +29,16 @@ from vspc.async_telnet import IAC, SB, SE, DO, DONT, WILL, WONT
 opts = [
     cfg.StrOpt('host',
                default='0.0.0.0',
-               help='Host on which to listen for incoming requests'),
+               help='Host on which to listen for incoming requests from VMs'),
     cfg.IntOpt('port',
                default=13370,
-               help='Port on which to listen for incoming requests'),
+               help='Port on which to listen for incoming requests from VMs'),
+    cfg.StrOpt('client_host',
+               default='127.0.0.1',
+               help='Host on which to listen for incoming requests from clients'),
+    cfg.IntOpt('vm_start_port',
+               default=20000,
+               help='Start port for client connection listeners'),
     cfg.StrOpt('cert', help='SSL certificate file'),
     cfg.StrOpt('key', help='SSL key file (if separate from cert)'),
     cfg.StrOpt('uri', help='VSPC URI'),
@@ -76,7 +82,9 @@ SUPPORTED_OPTS = (KNOWN_SUBOPTIONS_1 + KNOWN_SUBOPTIONS_2 + VMOTION_BEGIN +
 class VspcServer(object):
     def __init__(self):
         self._uuid_to_vm_writer = dict()
+        self._uuid_to_client_listener = dict()
         self._uuid_to_client_writers = dict()
+        self._uuid_to_port = dict()
         self._loop = asyncio.get_event_loop()
 
     @asyncio.coroutine
@@ -199,8 +207,8 @@ class VspcServer(object):
             f.write(data)
 
     @asyncio.coroutine
-    def handle_proxy(self, reader, writer, uuid):
-        LOG.info("Proxy client connected for uuid: %s", uuid)
+    def handle_client(self, reader, writer, uuid):
+        LOG.info("Client connected for VM with UUID='%s'", uuid)
         client_writers = self._uuid_to_client_writers.get(uuid, [])
         client_writers.append(writer)
         self._uuid_to_client_writers[uuid] = client_writers
@@ -214,9 +222,46 @@ class VspcServer(object):
                 yield from vm_writer.drain()
                 data = yield from reader.read(1024)
         finally:
-            self._uuid_to_client_writers[uuid].remove(writer)
-        LOG.info("Proxy client disconnected for uuid: %s", uuid)
+            client_writers = self._uuid_to_client_writers.get(uuid)
+            if client_writers:
+                client_writers.remove(writer)
+        LOG.info("Client disconnected for VM with UUID='%s'", uuid)
         writer.close()
+
+    def _find_port(self):
+        for port in range(CONF.vm_start_port, 65535):
+            if port not in self._uuid_to_port.values():
+                return port
+        raise Exception("Unable to find free port")
+
+    @asyncio.coroutine
+    def _start_client_listener(self, writer, uuid):
+        port = self._find_port()
+        client_handler = functools.partial(self.handle_client, uuid=uuid)
+        self._uuid_to_vm_writer[uuid] = writer
+        self._uuid_to_port[uuid] = port
+        try:
+            coro = asyncio.start_server(client_handler, CONF.client_host, port, loop=self._loop)
+            client_listener = yield from asyncio.wait_for(coro, None)
+            self._uuid_to_client_listener[uuid] = client_listener
+        except Exception:
+            LOG.error("Unable to start client listener on port %d for VM with UUID='%s'", port, uuid)
+            del self._uuid_to_vm_writer[uuid]
+            del self._uuid_to_port[uuid]
+            raise
+        LOG.info("Started client listener on port %d for VM with UUID='%s'", port, uuid)
+
+    @asyncio.coroutine
+    def _stop_client_listener(self, uuid):
+        port = self._uuid_to_port.pop(uuid)
+        LOG.info("Stopping client listener on port %d for VM with UUID='%s'", port, uuid)
+        del self._uuid_to_vm_writer[uuid]
+        client_listener = self._uuid_to_client_listener.pop(uuid)
+        client_listener.close()
+        yield from asyncio.wait_for(client_listener.wait_closed(), None)
+        client_writers = self._uuid_to_client_writers.pop(uuid, [])
+        for client_writer in client_writers:
+            client_writer.close()
 
     @asyncio.coroutine
     def handle_telnet(self, reader, writer):
@@ -235,13 +280,8 @@ class VspcServer(object):
             LOG.error("%s didn't present UUID", peer)
             writer.close()
             return
-        self._uuid_to_vm_writer[uuid] = writer
 
-        proxy_handler = functools.partial(self.handle_proxy, uuid=uuid)
-        coro = asyncio.start_server(proxy_handler, '127.0.0.1', 9999, loop=self._loop)
-        proxy_srv = yield from asyncio.wait_for(coro, None)
-        LOG.info("Started proxy server on port 9999")
-
+        yield from self._start_client_listener(writer, uuid)
         data = yield from asyncio.wait_for(read_task, None)
         try:
             while data:
@@ -252,16 +292,8 @@ class VspcServer(object):
                     yield from client_writer.drain()
                 data = yield from telnet.read_some()
         finally:
-            self._uuid_to_vm_writer.pop(uuid)
+            yield from self._stop_client_listener(uuid)
         LOG.info("%s disconnected", peer)
-
-        LOG.info("Stopping proxy server on port 9999")
-        proxy_srv.close()
-        yield from asyncio.wait_for(proxy_srv.wait_closed(), None)
-        client_writers = self._uuid_to_client_writers.get(uuid, [])
-        for client_writer in client_writers:
-            client_writer.close()
-
         writer.close()
 
     def start(self):
