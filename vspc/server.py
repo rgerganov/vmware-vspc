@@ -39,6 +39,10 @@ opts = [
     cfg.IntOpt('vm_start_port',
                default=20000,
                help='Start port for client connection listeners'),
+    cfg.IntOpt('enable_clients',
+               default=False,
+               help='If enabled, accept client connections on "client_host" and '
+                    'relay traffic between VMs and clients'),
     cfg.StrOpt('cert', help='SSL certificate file'),
     cfg.StrOpt('key', help='SSL key file (if separate from cert)'),
     cfg.StrOpt('uri', help='VSPC URI'),
@@ -264,6 +268,13 @@ class VspcServer(object):
             client_writer.close()
 
     @asyncio.coroutine
+    def _dispatch_to_client_writers(self, data, uuid):
+        client_writers = self._uuid_to_client_writers.get(uuid, [])
+        for client_writer in client_writers:
+            client_writer.write(data)
+            yield from client_writer.drain()
+
+    @asyncio.coroutine
     def handle_telnet(self, reader, writer):
         vm_uuid_rcvd = asyncio.Future()
         opt_handler = functools.partial(self.option_handler, writer=writer,
@@ -281,18 +292,18 @@ class VspcServer(object):
             writer.close()
             return
 
-        yield from self._start_client_listener(writer, uuid)
+        if CONF.enable_clients:
+            yield from self._start_client_listener(writer, uuid)
         data = yield from asyncio.wait_for(read_task, None)
         try:
             while data:
                 self.save_to_log(uuid, data)
-                client_writers = self._uuid_to_client_writers.get(uuid, [])
-                for client_writer in client_writers:
-                    client_writer.write(data)
-                    yield from client_writer.drain()
+                if CONF.enable_clients:
+                    self._dispatch_to_client_writers(data, uuid)
                 data = yield from telnet.read_some()
         finally:
-            yield from self._stop_client_listener(uuid)
+            if CONF.enable_clients:
+                yield from self._stop_client_listener(uuid)
         LOG.info("%s disconnected", peer)
         writer.close()
 
