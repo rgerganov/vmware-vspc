@@ -304,7 +304,7 @@ class VspcServer(object):
             while data:
                 self.save_to_log(uuid, data)
                 if CONF.enable_clients:
-                    self._dispatch_to_client_writers(data, uuid)
+                    yield from self._dispatch_to_client_writers(data, uuid)
                 data = yield from telnet.read_some()
         finally:
             del self._uuid_to_vm_writer[uuid]
@@ -353,7 +353,6 @@ class VspcServer(object):
             coro = asyncio.start_server(self.handle_admin,
                                         CONF.admin_host,
                                         CONF.admin_port,
-                                        ssl=ssl_context,
                                         loop=self._loop)
             admin_server = self._loop.run_until_complete(coro)
 
