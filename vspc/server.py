@@ -121,7 +121,7 @@ class VspcServer(object):
         secret = os.urandom(4)
         LOG.debug(">> %s VMOTION-GOAHEAD %s %s", peer, data, secret)
         writer.write(IAC + SB + VMWARE_EXT + VMOTION_GOAHEAD +
-                     data + secret + IAC + SE)
+                     async_telnet.AsyncTelnet.escape(data + secret) + IAC + SE)
         yield from writer.drain()
 
     @asyncio.coroutine
@@ -130,7 +130,8 @@ class VspcServer(object):
         peer = socket.getpeername()
         LOG.debug("<< %s VMOTION-PEER %s", peer, data)
         LOG.debug("<< %s VMOTION-PEER-OK %s", peer, data)
-        writer.write(IAC + SB + VMWARE_EXT + VMOTION_PEER_OK + data + IAC + SE)
+        writer.write(IAC + SB + VMWARE_EXT + VMOTION_PEER_OK +
+                     async_telnet.AsyncTelnet.escape(data) + IAC + SE)
         yield from writer.drain()
 
     def handle_vmotion_complete(self, socket, data):

@@ -44,6 +44,12 @@ class AsyncTelnet:
         self.sb = 0  # flag for SB and SE sequence.
         self.sbdataq = b''
 
+    @staticmethod
+    def escape(data):
+        """Escape any Telnet IACs with another IAC.
+        """
+        return data.replace(IAC, IAC + IAC)
+
     @asyncio.coroutine
     def process_rawq(self):
         """Transfer from raw queue to cooked queue.
