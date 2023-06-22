@@ -129,7 +129,7 @@ class VspcServer(object):
         socket = writer.get_extra_info('socket')
         peer = socket.getpeername()
         LOG.debug("<< %s VMOTION-PEER %s", peer, data)
-        LOG.debug("<< %s VMOTION-PEER-OK %s", peer, data)
+        LOG.debug(">> %s VMOTION-PEER-OK %s", peer, data)
         writer.write(IAC + SB + VMWARE_EXT + VMOTION_PEER_OK +
                      async_telnet.AsyncTelnet.escape(data) + IAC + SE)
         yield from writer.drain()
@@ -137,6 +137,10 @@ class VspcServer(object):
     def handle_vmotion_complete(self, socket, data):
         peer = socket.getpeername()
         LOG.debug("<< %s VMOTION-COMPLETE %s", peer, data)
+
+    def handle_vmotion_abort(self, socket, data):
+        peer = socket.getpeername()
+        LOG.debug("<< %s VMOTION-ABORT %s", peer, data)
 
     @asyncio.coroutine
     def handle_do(self, writer, opt):
@@ -183,6 +187,8 @@ class VspcServer(object):
                 yield from self.handle_vmotion_peer(writer, data[2:])
             elif vmw_cmd == VMOTION_COMPLETE:
                 self.handle_vmotion_complete(socket, data[2:])
+            elif vmw_cmd == VMOTION_ABORT:
+                self.handle_vmotion_abort(socket, data[2:])
             else:
                 LOG.error("Unknown VMware cmd: %s %s", vmw_cmd, data[2:])
                 writer.close()
